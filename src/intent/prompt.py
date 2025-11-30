@@ -33,9 +33,8 @@ Task:
    - title (short action title)
    - description (optional)
    - expected_fields (list of field names)
-   - prefill (array of {field, hint, value} suggestions to prefill UI form; hint is user-facing text)
+   - prefill (array of {{field, hint, value}} suggestions to prefill UI form; hint is user-facing text)
 3) Use the JSON schema (strict) and make suggestions only when confident.
 
 Now produce the JSON response.
 """
-
