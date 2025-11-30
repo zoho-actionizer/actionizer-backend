@@ -1,6 +1,6 @@
 import httpx
-from auth import zoho_headers
-from constants import DEFAULT_TIMEOUT
+from src.auth import zoho_headers
+from src.constants import DEFAULT_TIMEOUT
 
 
 async def create_zoho_calendar_event(access_token, calendar_id, title, start_iso, end_iso, location=None, description=None):
