@@ -1,20 +1,21 @@
 import logging
 
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, status
 
-from api.schemas import AnalyzeIntentRequest, AnalyzeIntentResponse, ExecuteActionRequest, ExecuteActionResponse, PrefillHint, SuggestedAction
-from auth import get_valid_zoho_access_token_for_tenant
-from integrations import TOOLS_INFO
-from integrations.jira import create_jira_ticket
-from integrations.zoho.calendar import create_zoho_calendar_event
-from integrations.zoho.projects import create_zoho_project_task
-from intent.analysis import call_llm
+from src.integrations.zoho.workdrive import workdrive_action
+from src.api.schemas import AnalyzeIntentRequest, AnalyzeIntentResponse, ExecuteActionRequest, ExecuteActionResponse, PrefillHint, SuggestedAction
+from src.auth import UserNotFound, get_zoho_access_token
+from src.integrations import TOOLS_INFO
+from src.integrations.jira import create_jira_ticket
+from src.integrations.zoho.calendar import create_zoho_calendar_event
+from src.integrations.zoho.projects import create_zoho_project_task
+from src.intent.analysis import call_llm
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-_actions_db = {}
+_actions_db: dict[str, SuggestedAction] = {}
 
 
 @router.post("/analyze-intent", response_model=AnalyzeIntentResponse)
@@ -25,25 +26,24 @@ async def analyze_intent(req: AnalyzeIntentRequest):
     """
     # Provide the LLM with the tool descriptions and ask for strict JSON output
     llm_out = await call_llm(req.message_text, req.metadata, TOOLS_INFO)
-    # Validate and coerce into our response model
     try:
-        # The LLM returns top-level {"suggestions": [...]}
-        suggestions_raw = llm_out.get("suggestions", [])
         suggestions = []
-        for s in suggestions_raw:
-            # Basic validation/coercion
+        for s in llm_out:
+            logger.debug(f"Processing suggestion: {s.get('tool')}")
             suggestion = SuggestedAction(
                 tool=s["tool"],
                 score=float(s.get("score", 0.0)),
                 title=s.get("title", ""),
                 description=s.get("description"),
                 expected_fields=s.get("expected_fields", []),
-                prefill=[PrefillHint(**p) for p in s.get("prefill", [])]
+                prefill=s.get("prefill", {})
             )
             suggestions.append(suggestion)
             _actions_db[str(suggestion.action_id)] = suggestion
+            logger.info(f"Stored action {suggestion.action_id} for tool {suggestion.tool}")
         return AnalyzeIntentResponse(suggestions=suggestions)
     except Exception as e:
+        logger.error(f"Invalid LLM schema or parse error: {e}")
         raise HTTPException(status_code=500, detail=f"Invalid LLM schema or parse error: {e}")
 
 
@@ -55,10 +55,15 @@ async def execute_action(req: ExecuteActionRequest):
     """
     action = _actions_db[str(req.action_id)]
     tool = action.tool
-    fields = action.expected_fields
+    fields = action.prefill
+    filtered_keys = [x for x in req.updated_params.keys() if x in set(action.expected_fields)]
+    fields.update({k:req.updated_params[k] for k in filtered_keys})
+
+    logger.debug(f"Executing action {req.action_id} for tool {tool}")
 
     # Short-circuit common validation
     if tool == "jira":
+        logger.info(f"Processing Jira action")
         # required fields: project_key, summary, description (issuetype optional)
         project_key = fields.get("project_key")
         summary = fields.get("summary")
@@ -66,32 +71,41 @@ async def execute_action(req: ExecuteActionRequest):
         issuetype = fields.get("issuetype", "Task")
         duedate = fields.get("duedate")
         if not project_key or not summary:
+            logger.warning("Missing project_key or summary for Jira")
             raise HTTPException(status_code=400, detail="Missing project_key or summary for Jira")
         jira_res = await create_jira_ticket(project_key, summary, description, issuetype, duedate)
+        logger.info(f"Jira ticket created successfully")
         return ExecuteActionResponse(success=True, result={"jira": jira_res})
 
     # Zoho flows require tenant OAuth setup ensure we have access token for tenant
-    access_token = await get_valid_zoho_access_token_for_tenant(tenant)  # TODO: fix tenant configuration
-    auth_header_value = f"Zoho-oauthtoken {access_token}"
-    args = [access_token]
+    try:
+        logger.debug("Retrieving Zoho access token")
+        access_token = await get_zoho_access_token()  # TODO: fix tenant configuration
+    except UserNotFound:
+        logger.warning("User not found, authorization required")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization not done")
+
 
     async def f(*args):return None
     func = f
+    args = [access_token]
 
     if tool == "zoho_calendar":
+        logger.info("Processing Zoho Calendar action")
         calendar_id = fields.get("calendar_id")
         title = fields.get("title")
         start_iso = fields.get("start_iso")
         end_iso = fields.get("end_iso")
         if not (calendar_id and title and start_iso and end_iso):
+            logger.warning("Missing calendar_id/title/start_iso/end_iso")
             raise HTTPException(status_code=400, detail="Missing calendar_id/title/start_iso/end_iso")
         args.extend(
-            [access_token, calendar_id, title, start_iso, end_iso, fields.get("location"), fields("description", None)]
+            [calendar_id, title, start_iso, end_iso, fields.get("location"), fields("description", None)]
         )
         func = create_zoho_calendar_event
-        
 
-    if tool == "zoho_workdrive":
+    elif tool == "zoho_workdrive":
+        logger.info("Processing Zoho WorkDrive action")
         # We support: search by name_or_query or direct file_id; then upload to Cliq chat if provided
         org_id = fields.get("org_id")
         name_or_query = fields.get("name_or_query")
@@ -99,68 +113,35 @@ async def execute_action(req: ExecuteActionRequest):
         # Optional: target cliq chat/channel posting info
         cliq_target = fields.get("cliq_target")  # dict with { "type": "chat"|"channel", "id": "<id>", "post_as": "<bot>" }
         if not (name_or_query or file_id):
+            logger.warning("Missing file_id or name_or_query for WorkDrive")
             raise HTTPException(status_code=400, detail="Provide file_id or name_or_query")
-        # if file_id absent, search
-        if not file_id:
-            search_json = await workdrive_search_files(access_token, org_id, name_or_query, limit=5)
-            # choose best match: first exact name or first result
-            hits = search_json.get("data") or search_json.get("files") or search_json
-            chosen = None
-            for item in (hits or []):
-                nm = item.get("name") or item.get("file_name") or item.get("title")
-                if nm == name_or_query:
-                    chosen = item; break
-            if not chosen:
-                chosen = (hits or [None])[0]
-            if not chosen:
-                raise HTTPException(status_code=404, detail="No file found in WorkDrive")
-            file_id = chosen.get("id") or chosen.get("file_id")
-            if not file_id:
-                # maybe the search returned downloadUrl
-                dl = chosen.get("download_url") or chosen.get("webUrl")
-                if not dl:
-                    raise HTTPException(status_code=500, detail="Search result lacks file_id or download_url")
-                # download direct
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    r = await client.get(dl, headers={"Authorization": f"Zoho-oauthtoken {access_token}"})
-                    r.raise_for_status()
-                    file_bytes = r.content
-            else:
-                file_bytes = await workdrive_download_file_bytes(access_token, file_id)
+        
+        func = workdrive_action
+        args.extend((org_id, name_or_query, file_id, cliq_target, fields))
 
-        else:
-            file_bytes = await workdrive_download_file_bytes(access_token, file_id)
-
-        # If a Cliq target is provided, post it
-        if cliq_target:
-            target_type = cliq_target.get("type")
-            target_id = cliq_target.get("id")
-            if target_type != "chat":
-                # For simplicity this code handles chat uploads. Channel variants: adapt endpoint.
-                raise HTTPException(status_code=501, detail="Only chat target implemented in this demo")
-            # We need a Cliq auth header — you can reuse Zoho product token (if it has Cliq scope) OR a bot token.
-            # Here we assume the same Zoho OAuth token can be used for Cliq (if the token had cliq scope)
-            res = await cliq_share_file_to_chat(auth_header_value, target_id, fields.get("filename") or "file.bin", file_bytes, message_text=fields.get("message"))
-            return ExecuteActionResponse(success=True, result={"shared_to_cliq": res})
-        else:
-            # return file bytes base64 encoded for demo
-            b64 = base64.b64encode(file_bytes).decode()
-            return ExecuteActionResponse(success=True, result={"file_id": file_id, "file_base64": b64})
-
-    if tool == "zoho_projects":
+    elif tool == "zoho_projects":
+        logger.info("Processing Zoho Projects action")
         # create task via Projects REST API
         portal_id = fields.get("portal_id")
         project_id = fields.get("project_id")
         name = fields.get("name")
         description = fields.get("description", "")
+        start_date = fields.get("start_date", None),
+        end_date = fields.get("end_date", None),
+        priority = fields.get("priority", None),
+        owner_ids = fields.get("owner_ids", None)
+
         if not (portal_id and project_id and name):
+            logger.warning("Missing portal_id, project_id, or name for Projects")
             raise HTTPException(status_code=400, detail="Missing portal_id, project_id, or name")
-        args.extend([portal_id, project_id, name, description])
+        args.extend((portal_id, project_id, name, description, start_date, end_date, priority, owner_ids))
         func = create_zoho_project_task
 
     try:
+        logger.debug(f"Calling function with args")
         r = await func(*args)
-        return ExecuteActionResponse(success=True, result={"resp": r})
+        logger.info(f"Action executed successfully")
+        return ExecuteActionResponse(success=True, result={"action_resp": r})
     except Exception as exp:
-        logger.exception("")
+        logger.exception(f"Action execution failed: {exp}")
         raise HTTPException(status_code=400, detail=f"{exp}") from exp
