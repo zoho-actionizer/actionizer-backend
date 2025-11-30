@@ -105,36 +105,35 @@ New tools or workflows can be added by simply updating the tool definitions and 
 
 ```mermaid
 flowchart LR
-    subgraph CLQ[Zoho Cliq (Frontend Extension)]
-        A[User selects message\n→ Quick Actions]
-        B[Extension sends\nmessage + metadata]
-        C[Show Suggested Actions\n(from backend)]
-        D[User picks action\n& confirms fields]
-        E[Show success + link\nor attached file]
+    subgraph "Zoho Cliq (Frontend Extension)"
+        A["User selects message → Quick Actions"]
+        B["Extension sends message + metadata"]
+        C["Show Suggested Actions (from backend)"]
+        D["User picks action & confirms fields"]
+        E["Show success + link or attached file"]
     end
 
-    subgraph BE[Backend (FastAPI)]
+    subgraph "Backend (FastAPI)"
         F[/POST /analyze-intent/]
         G[/POST /execute-action/]
-        H[LLM Prompt Builder]
-        I[LLM Parser\n(JSON enforced)]
-        J[Integration Layer\n(Jira/Projects/Calendar/WorkDrive)]
-        K[Zoho OAuth Token\nRefresh Manager]
+        H["LLM Prompt Builder"]
+        I["LLM Parser (JSON enforced)"]
+        J["Integration Layer (Jira / Projects / Calendar / WorkDrive)"]
+        K["Zoho OAuth Token Refresh Manager"]
     end
 
-    subgraph LLM[Gemini 2.0 Flash]
-        L[Intent Analysis\nTool Selection\nPrefill Generation]
+    subgraph "Gemini 2.0 Flash (LLM)"
+        L[Intent Analysis / Tool Selection / Prefill Generation]
     end
 
-    subgraph INT[External Integrations]
+    subgraph "External Integrations"
         M[Jira API]
         N[Zoho Projects API]
         O[Zoho Calendar API]
         P[Zoho WorkDrive API]
-        Q[Zoho Cliq API\n(File Upload / Messages)]
+        Q["Zoho Cliq API (File Upload / Messages)"]
     end
 
-    %% FLows
     A --> B --> F
     F --> H --> L
     L --> I --> C
