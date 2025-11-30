@@ -15,10 +15,9 @@ class AnalyzeIntentRequest(BaseModel):
     tenant: Optional[str] = Field(None, description="tenant id or org id to resolve tokens")
 
 
-class PrefillHint(BaseModel):
-    field: str
-    hint: str
-    value: Optional[Any] = None
+# class PrefillHint(BaseModel):
+#     field: str
+#     value: Optional[Any] = None
 
 
 class SuggestedAction(BaseModel):
@@ -26,7 +25,7 @@ class SuggestedAction(BaseModel):
     score: float  # relevance score (0-1)
     title: str
     description: Optional[str]
-    prefill: list[PrefillHint] = []
+    prefill: dict[str, Any]
     # expected_fields informs frontend what fields to show in preview form
     expected_fields: list[str] = []
     action_id: uuid.UUID = Field(default_factory=uuid.uuid4)
@@ -38,6 +37,7 @@ class AnalyzeIntentResponse(BaseModel):
 
 class ExecuteActionRequest(BaseModel):
     action_id: str
+    updated_params: dict[str, Any]
 
 
 class ExecuteActionResponse(BaseModel):
