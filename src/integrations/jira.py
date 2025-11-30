@@ -1,7 +1,7 @@
 from jira import JIRA
 
 
-def create_jira_ticket(title, description, project_key):
+def create_jira_ticket(title, description, issuetype, project_key, due_date):
     jira = JIRA(
         server="https://your-domain.atlassian.net",
         basic_auth=("email@example.com", "api_token")
@@ -11,7 +11,7 @@ def create_jira_ticket(title, description, project_key):
         "project": {"key": project_key},
         "summary": title,
         "description": description,
-        "issuetype": {"name": "Task"}
+        "issuetype": {"name": issuetype}
     })
 
     return {
