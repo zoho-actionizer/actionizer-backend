@@ -1,12 +1,60 @@
 
+import atexit
+from enum import StrEnum
 import os
 from fastapi import HTTPException
 from typing import Any
 import requests
 import time
 import httpx
-from constants import DEFAULT_TIMEOUT, ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET
-from integrations.zoho.urls import ZOHO_ACCOUNTS_URL
+from src.constants import DEFAULT_TIMEOUT, ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, SERVER_PORT, SERVER_HOST
+from src.integrations.zoho.urls import ZOHO_ACCOUNTS_URL
+import pickle
+import sys
+
+
+class ZohoTokenStore:
+    access_token: str = ""
+    refresh_token: str = ""
+    expiry_ts: int | float = 0
+
+
+class UserNotFound(KeyError):
+    user_id: str
+
+
+class Scopes(StrEnum):
+    Projects="ZohoProjects.portals.ALL%20ZohoProjects.tasks.ALL"
+    WorkDrive="WorkDrive.files.READ%20WorkDrive.files.ALL"
+    Calendar="ZohoCalendar.event.ALL"
+    # Cliq="ZohoCliq.Webhook.CREATE%20ZohoCliq.Chats.READ%20ZohoCliq.Chats.UPDATE"
+
+
+GRANT_CODE_AUTH_URI = ZOHO_ACCOUNTS_URL + "/v2/auth?scope={scopes}&client_id={client_id}&response_type=code&access_type=offline&redirect_uri={redirect_uri}"
+
+EXCHANGE_GRANT_CODE = ZOHO_ACCOUNTS_URL + "/v2/token" #"?grant_type=authorization_code&client_id={client_id}&client_secret={client_secret}&code={code}&redirect_uri={redirect_uri}"
+
+REDIRECT_URI = f"http://{SERVER_HOST}:{SERVER_PORT}/authsuccess"
+
+ZOHO_REFRESH_STORE: dict[str, ZohoTokenStore] = {}  # keyed by user_or_tenant
+
+ZOHO_REFRESH_STORE["1"] = ZohoTokenStore()  # only one user for now
+ZOHO_STORE_FILE = "zoho_token_store.pkl"
+
+def load_zoho_store():
+    global ZOHO_REFRESH_STORE
+    if os.path.exists(ZOHO_STORE_FILE):
+        with open(ZOHO_STORE_FILE, "rb") as f:
+            ZOHO_REFRESH_STORE = pickle.load(f)
+    else:
+        ZOHO_REFRESH_STORE["1"] = ZohoTokenStore()
+
+def save_zoho_store():
+    with open(ZOHO_STORE_FILE, "wb") as f:
+        pickle.dump(ZOHO_REFRESH_STORE, f)
+
+load_zoho_store()
+atexit.register(save_zoho_store)
 
 
 def zoho_headers(access_token):
@@ -16,55 +64,64 @@ def zoho_headers(access_token):
     }
 
 
-ZOHO_REFRESH_STORE: dict[str, dict[str, Any]] = {}  # keyed by user_or_tenant
-
-
-def get_stored_refresh_token(tenant: str):
-    """
-    Simple in-memory store for demo.
-    ZOHO_REFRESH_STORE[tenant] = {"refresh_token": "...", "access_token": "...", "expiry_ts": 12345}
-    """
-    entry = ZOHO_REFRESH_STORE.get(tenant)
-    if not entry:
-        return None
-    return entry.get("refresh_token")
-    
-    
-async def get_valid_zoho_access_token_for_tenant(tenant: str):
-    """
-    Returns a valid access_token for tenant, refreshing if necessary.
-    """
-    entry = ZOHO_REFRESH_STORE.get(tenant)
-    if not entry:
-        raise HTTPException(status_code=400, detail="No OAuth entry for tenant; perform OAuth flow first")
-    if entry.get("access_token") and entry.get("expiry_ts", 0) > time.time() + 60:
-        return entry["access_token"]
-
-    refreshed = await refresh_zoho_access_token(entry["refresh_token"])
-    entry["access_token"] = refreshed["access_token"]
-    entry["expiry_ts"] = refreshed["expiry_ts"]
-    ZOHO_REFRESH_STORE[tenant] = entry
-    return entry["access_token"]
-
-
-async def refresh_zoho_access_token(refresh_token: str) -> dict[str, Any]:
-    """
-    Call Zoho Accounts to exchange refresh token for access token.
-    Returns dict containing access_token, expires_in, expiry_ts.
-    """
-    url = f"{ZOHO_ACCOUNTS_URL}/oauth/v2/token"
-    params = {
-        "refresh_token": refresh_token,
+async def create_zoho_access_token(code, user_id="1") -> ZohoTokenStore:
+    data = {
+        "grant_type": "authorization_code",
         "client_id": ZOHO_CLIENT_ID,
         "client_secret": ZOHO_CLIENT_SECRET,
-        "grant_type": "refresh_token"
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
     }
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-        r = await client.post(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-    return {
-        "access_token": data["access_token"],
-        "expires_in": int(data.get("expires_in", 3600)),
-        "expiry_ts": int(time.time()) + int(data.get("expires_in", 3600))
+
+    async with httpx.AsyncClient() as ac:
+        resp = await ac.post(EXCHANGE_GRANT_CODE, data=data)
+        resp.raise_for_status()
+        resp_json = resp.json()
+        assert "error" not in resp_json, f"error in oauth flow {resp_json=}"
+
+    # resp format
+    # {
+    #   "access_token": "1000.xxxxx",
+    #   "refresh_token": "1000.xxxxx",
+    #   "expires_in": 3600,
+    #   "api_domain": "https://www.zohoapis.com"
+    # }
+    store = ZOHO_REFRESH_STORE[user_id]
+    store.access_token = resp_json["access_token"]
+    store.expiry_ts = time.time() + 3600
+    store.refresh_token = resp_json["refresh_token"]
+    return store
+
+
+async def get_zoho_access_token(user_id="1"):
+    """Returns a valid access token (refreshes if expired)."""
+    if user_id not in ZOHO_REFRESH_STORE:
+        raise UserNotFound(user_id)
+
+    store = ZOHO_REFRESH_STORE[user_id]
+    if store.access_token and store.expiry_ts > time.time() + 60:
+        return store.access_token
+    return await refresh_zoho_access_token(user_id)
+
+
+async def refresh_zoho_access_token(user_id="1"):
+    """Refresh the Zoho access token using a stored refresh token."""
+    url = f"{ZOHO_ACCOUNTS_URL}/oauth/v2/token"
+    store = ZOHO_REFRESH_STORE[user_id]
+
+    params = {
+        "grant_type": "refresh_token",
+        "client_id": os.getenv("ZOHO_CLIENT_ID"),
+        "client_secret": os.getenv("ZOHO_CLIENT_SECRET"),
+        "refresh_token": store.refresh_token
     }
+
+    async with httpx.AsyncClient(timeout=20) as cl:
+        resp = await cl.post(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        store.access_token = data["access_token"]
+        store.expiry_ts = time.time() + data.get("expires_in", 3600)
+
+        return store.access_token
